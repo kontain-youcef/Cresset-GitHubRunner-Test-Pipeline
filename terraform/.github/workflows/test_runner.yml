@@ -1,0 +1,254 @@
+name: "Hybrid CI (On-prem first, AWS burst; OS-only)"
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  ORG: ${{ github.repository_owner }}
+  AWS_REGION: "eu-west-2"                      # <-- change
+  AWS_ROLE_ARN: "arn:aws:iam::467659040865:oidc-provider/token.actions.githubusercontent.com"   # <-- change
+  RUNNER_SSM_PARAM_PREFIX: "/gha/runner-token"
+  RUNNER_VERSION: "2.317.0"
+
+jobs:
+  controller:
+    name: "Plan matrix + backlog (jobs, not runs)"
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      run_jobs: ${{ steps.plan.outputs.run_jobs }}
+      backlog_jobs: ${{ steps.backlog.outputs.backlog }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: plan
+        name: "Build fixed OS matrix (linux + windows)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          matrix='{"include":[{"os":"linux"},{"os":"windows"}]}'
+          linux_jobs=$(jq '[.include[] | select(.os=="linux")]   | length' <<<"$matrix")
+          windows_jobs=$(jq '[.include[] | select(.os=="windows")] | length' <<<"$matrix")
+          run_jobs=$(jq -n --argjson l "$linux_jobs" --argjson w "$windows_jobs" '{linux:$l, windows:$w}')
+          echo "matrix=$matrix"       >> "$GITHUB_OUTPUT"
+          echo "run_jobs=$run_jobs"   >> "$GITHUB_OUTPUT"
+
+      - id: backlog
+        name: "Estimate queued jobs for this workflow"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo="${{ github.repository }}"
+          wf_name="${{ github.workflow }}"
+          wf_id=$(gh api "repos/$repo/actions/workflows" \
+            --jq '.workflows[] | select(.name=="'"$wf_name"'") | .id' | head -n1)
+          queued_runs=$(gh api "repos/$repo/actions/workflows/$wf_id/runs?status=queued&per_page=1" \
+            --jq '.total_count')
+          RJ='${{ steps.plan.outputs.run_jobs }}'
+          backlog=$(jq -n \
+            --argjson l "$(( queued_runs * $(jq -r '.linux'   <<<"$RJ") ))" \
+            --argjson w "$(( queued_runs * $(jq -r '.windows' <<<"$RJ") ))" \
+            '{linux:$l, windows:$w}')
+          echo "backlog=$backlog" >> "$GITHUB_OUTPUT"
+
+  capacity:
+    name: "Compute AWS desired per OS = jobs_now + backlog − onprem_free"
+    needs: controller
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GH_MGMT_TOKEN }}  # org token for runner inventory + reg token
+      CAP_LINUX: "50"
+      CAP_WINDOWS: "20"
+    outputs:
+      desired_aws: ${{ steps.calc.outputs.desired_aws }}
+      aws_os: ${{ steps.calc.outputs.aws_os }}
+    steps:
+      - id: calc
+        shell: bash
+        run: |
+          set -euo pipefail
+          RJ='${{ needs.controller.outputs.run_jobs }}'
+          BJ='${{ needs.controller.outputs.backlog_jobs }}'
+          org='${{ env.ORG }}'
+
+          free_os() {
+            local os="$1"
+            local online=$(gh api "orgs/$org/actions/runners?per_page=100" --paginate --jq \
+              '.runners[] | select(.status=="online"
+                                   and ([.labels[].name]|index("onprem"))
+                                   and ([.labels[].name]|index("'"$os"'"))) | 1' | wc -l)
+            local busy=$(gh api "orgs/$org/actions/runners?per_page=100" --paginate --jq \
+              '.runners[] | select(.status=="online" and .busy==true
+                                   and ([.labels[].name]|index("onprem"))
+                                   and ([.labels[].name]|index("'"$os"'"))) | 1' | wc -l)
+            echo $(( online - busy ))
+          }
+
+          free_linux=$(free_os linux)
+          free_windows=$(free_os windows)
+
+          jobs_now_linux=$(jq -r '.linux'   <<<"$RJ")
+          jobs_now_windows=$(jq -r '.windows' <<<"$RJ")
+          backlog_linux=$(jq -r '.linux'   <<<"$BJ")
+          backlog_windows=$(jq -r '.windows' <<<"$BJ")
+
+          d_linux=$(( jobs_now_linux + backlog_linux - free_linux ));       [[ $d_linux   -lt 0 ]] && d_linux=0
+          d_windows=$(( jobs_now_windows + backlog_windows - free_windows ));[[ $d_windows -lt 0 ]] && d_windows=0
+
+          [[ $d_linux   -gt ${CAP_LINUX}   ]] && d_linux=${CAP_LINUX}
+          [[ $d_windows -gt ${CAP_WINDOWS} ]] && d_windows=${CAP_WINDOWS}
+
+          desired=$(jq -n --argjson l "$d_linux" --argjson w "$d_windows" '{linux:$l, windows:$w}')
+
+          aws_os=":"
+          if [ "$d_linux" -gt 0 ];   then aws_os="${aws_os}linux:";   fi
+          if [ "$d_windows" -gt 0 ]; then aws_os="${aws_os}windows:"; fi
+
+          echo "desired_aws=$desired" >> "$GITHUB_OUTPUT"
+          echo "aws_os=$aws_os"       >> "$GITHUB_OUTPUT"
+
+  provision_aws:
+    name: "Provision EC2 runners via Terraform"
+    needs: [ controller, capacity ]
+    if: ${{ needs.capacity.outputs.aws_os != '' && needs.capacity.outputs.aws_os != ':' }}
+    runs-on: ubuntu-latest
+    env:
+      PARAM_NAME: /gha/runner-token/${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Configure AWS creds (OIDC)"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: "Create GitHub runner registration token (org)"
+        id: reg
+        env:
+          GH_TOKEN: ${{ secrets.GH_MGMT_TOKEN }}
+        run: |
+          token=$(gh api -X POST "orgs/${{ env.ORG }}/actions/runners/registration-token" --jq '.token')
+          echo "token=$token" >> "$GITHUB_OUTPUT"
+
+      - name: "Store token in SSM SecureString"
+        run: |
+          aws ssm put-parameter --name "${PARAM_NAME}" --type "SecureString" \
+            --value "${{ steps.reg.outputs.token }}" --overwrite
+
+      - name: "Write gha.auto.tfvars.json"
+        working-directory: infra/gha-runners
+        shell: bash
+        run: |
+          cat > gha.auto.tfvars.json <<'EOF'
+          {
+            "linux_desired":   ${{ fromJson(needs.capacity.outputs.desired_aws).linux }},
+            "windows_desired": ${{ fromJson(needs.capacity.outputs.desired_aws).windows }},
+            "linux_instance_type":   "t3.medium",
+            "windows_instance_type": "t3.large",
+            "region":           "${{ env.AWS_REGION }}",
+            "org":              "${{ env.ORG }}",
+            "runner_token_parameter_name": "${{ env.PARAM_NAME }}",
+            "runner_version":   "${{ env.RUNNER_VERSION }}",
+            "vpc_id":           "vpc-0e17e1f6059b9f8bd",
+            "subnet_ids":       ["subnet-05e0a6eff000312a3","subnet-07f8013217f2c2eb7"]
+          }
+          EOF
+
+      - name: "Terraform apply"
+        working-directory: infra/gha-runners
+        run: |
+          terraform init -input=false
+          terraform apply -auto-approve
+
+  build_onprem_linux:
+    name: "Build on on-prem Linux"
+    needs: [ controller, capacity ]
+    if: ${{ !contains(needs.capacity.outputs.aws_os, ':linux:') }}
+    runs-on: ["self-hosted","onprem","linux"]
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "On-prem build for Linux"
+      - run: ./ci/build-linux.sh
+
+  build_aws_linux:
+    name: "Build on AWS Linux"
+    needs: [ controller, capacity, provision_aws ]
+    if: ${{ contains(needs.capacity.outputs.aws_os, ':linux:') }}
+    runs-on: ["self-hosted","aws","linux"]
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "AWS build for Linux"
+      - run: ./ci/build-linux.sh
+
+  build_onprem_windows:
+    name: "Build on on-prem Windows"
+    needs: [ controller, capacity ]
+    if: ${{ !contains(needs.capacity.outputs.aws_os, ':windows:') }}
+    runs-on: ["self-hosted","onprem","windows"]
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "On-prem build for Windows"
+      - run: ./ci/build-windows.sh
+
+  build_aws_windows:
+    name: "Build on AWS Windows"
+    needs: [ controller, capacity, provision_aws ]
+    if: ${{ contains(needs.capacity.outputs.aws_os, ':windows:') }}
+    runs-on: ["self-hosted","aws","windows"]
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "AWS build for Windows"
+      - run: ./ci/build-windows.sh
+
+  teardown_aws:
+    name: "Teardown AWS capacity"
+    needs: [ build_aws_windows, build_aws_linux ]
+    if: ${{ always() && needs.capacity.outputs.aws_os != '' && needs.capacity.outputs.aws_os != ':' }}
+    runs-on: ubuntu-latest
+    env:
+      PARAM_NAME: /gha/runner-token/${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: "Configure AWS creds (OIDC)"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: "Write gha.auto.tfvars.json (scale to zero)"
+        working-directory: infra/gha-runners
+        shell: bash
+        run: |
+          cat > gha.auto.tfvars.json <<'EOF'
+          {
+            "linux_desired": 0,
+            "windows_desired": 0,
+            "linux_instance_type":   "t3.medium",
+            "windows_instance_type": "t3.large",
+            "region":           "${{ env.AWS_REGION }}",
+            "org":              "${{ env.ORG }}",
+            "runner_token_parameter_name": "${{ env.PARAM_NAME }}",
+            "runner_version":   "${{ env.RUNNER_VERSION }}",
+            "vpc_id":           "vpc-0e17e1f6059b9f8bd",
+            "subnet_ids":       ["subnet-05e0a6eff000312a3","subnet-07f8013217f2c2eb7"]
+          }
+          EOF
+
+      - name: "Terraform apply (scale to 0)"
+        working-directory: infra/gha-runners
+        run: |
+          terraform init -input=false
+          terraform apply -auto-approve
+
+      - name: "Delete SSM parameter"
+        run: aws ssm delete-parameter --name "${PARAM_NAME}" || true
