@@ -173,12 +173,24 @@ jobs:
   build_onprem_linux:
     name: "Build on on-prem Linux"
     needs: [ controller, capacity ]
-    if: ${{ !contains(needs.capacity.outputs.aws_os, ':linux:') }}
     runs-on: ["self-hosted","onprem","linux"]
     steps:
       - uses: actions/checkout@v4
       - run: echo "On-prem build for Linux"
       - run: ./ci/build-linux.sh
+      - name: Compute artifact name
+        id: meta
+        shell: bash
+        run: |
+           short_sha="${GITHUB_SHA::7}"
+           echo "name=build-linux-onprem-${short_sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact (Linux on-prem)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.name }}
+          path: dist/
+          if-no-files-found: error
 
   build_aws_linux:
     name: "Build on AWS Linux"
@@ -189,16 +201,42 @@ jobs:
       - uses: actions/checkout@v4
       - run: echo "AWS build for Linux"
       - run: ./ci/build-linux.sh
+      - name: Compute artifact name
+        id: meta
+        shell: bash
+        run: |
+          short_sha="${GITHUB_SHA::7}"
+          echo "name=build-linux-aws-${short_sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact (Linux AWS)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.name }}
+          path: dist/
+          if-no-files-found: error
 
   build_onprem_windows:
     name: "Build on on-prem Windows"
     needs: [ controller, capacity ]
-    if: ${{ !contains(needs.capacity.outputs.aws_os, ':windows:') }}
     runs-on: ["self-hosted","onprem","windows"]
     steps:
       - uses: actions/checkout@v4
       - run: echo "On-prem build for Windows"
       - run: ./ci/build-windows.sh
+      - name: Compute artifact name
+        id: meta
+        shell: bash
+        run: |
+          short_sha="${GITHUB_SHA::7}"
+          echo "name=build-windows-onprem-${short_sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact (Windows on-prem)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.name }}
+          path: dist/
+          if-no-files-found: error
+      
 
   build_aws_windows:
     name: "Build on AWS Windows"
@@ -209,6 +247,19 @@ jobs:
       - uses: actions/checkout@v4
       - run: echo "AWS build for Windows"
       - run: ./ci/build-windows.sh
+      - name: Compute artifact name
+        id: meta
+        shell: bash
+        run: |
+          short_sha="${GITHUB_SHA::7}"
+          echo "name=build-windows-aws-${short_sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact (Windows AWS)
+        uses: actions/upload-artifact@v4
+        with:
+         name: ${{ steps.meta.outputs.name }}
+         path: dist/
+         if-no-files-found: error
 
   teardown_aws:
     name: "Teardown AWS capacity"
